@@ -47,7 +47,8 @@ def clean(
     df = df[df.index.dayofweek < 5]
 
     # ── Drop holidays ──────────────────────────────────────────────────
-    df = df[~df.index.date.astype(object).isin(NSE_HOLIDAYS)]  # type: ignore[attr-defined]
+    import numpy as np
+    df = df[~np.isin(df.index.date, list(NSE_HOLIDAYS))]
 
     # ── Filter to market hours ─────────────────────────────────────────
     times = df.index.time

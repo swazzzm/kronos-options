@@ -50,7 +50,7 @@ kronos:
   repo_path: null            # e.g. "C:/path/to/Kronos"
   lookback: 400              # Input bars fed to Kronos (auto-truncated to 512 tokens internally)
   pred_len: 12               # Forecast horizon: 12 bars × 5 min = 60 min ahead
-  samples: 20                # Number of stochastic prediction paths (predict() called once per sample)
+  samples: 5                 # Number of stochastic prediction paths (predict() called once per sample)
   temperature: 1.0           # Sampling temperature — higher = more variance in paths
   top_p: 0.9                 # Nucleus sampling threshold
   cache_forecasts: true      # Store in SQLite to avoid re-running same inputs
@@ -158,5 +158,5 @@ backtest:
   use_real_option_data: true
   bs_fallback_when_missing: true
   iv_assumption_pct: 15.0    # Used ONLY for Black-Scholes fallback
-  default_start: "2025-01-01"
-  default_end: "2025-12-31"
+  default_start: "2026-05-01"
+  default_end: "2026-06-09"

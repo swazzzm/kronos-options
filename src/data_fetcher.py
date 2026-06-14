@@ -132,7 +132,7 @@ class DataFetcher:
     @staticmethod
     def _resample(df: pd.DataFrame, resolution: str) -> pd.DataFrame:
         """Resample 1-min OHLCV to a coarser bar (e.g., '5min', '15min')."""
-        rule = resolution.replace("min", "T")
+        rule = resolution  # pandas 2.2+ uses "5min" not "5T"
         agg = {
             "open":   "first",
             "high":   "max",
