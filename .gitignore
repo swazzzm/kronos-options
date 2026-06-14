@@ -1,0 +1,35 @@
+# Credentials — NEVER commit
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Data — too large for git; share separately or use Git LFS
+data/historical/
+data/*.db
+logs/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+*.suo
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
