@@ -8,10 +8,12 @@ Every 5 minutes:
   4. Send desktop notification on new signal.
   5. Mark open positions to market.
   6. Square off all positions by 15:15 IST.
+  7. [NEW] Tick WeeklyTrader for weekly options-selling strategies.
 
 Run:
     python -m src.paper_trader
     python -m src.paper_trader --symbols NIFTY BANKNIFTY
+    python -m src.paper_trader --no-weekly   # disable weekly strangle loop
 """
 from __future__ import annotations
 import argparse
@@ -28,6 +30,7 @@ from src.data_cleaner import clean, is_expiry_day
 from src.forecaster import KronosForecaster
 from src.signal_engine import SignalEngine
 from src.options_mapper import OptionsMapper
+from src.weekly_trader import WeeklyTrader, ensure_weekly_trades_table
 from src.utils import get_broker, load_config, now_ist, is_market_open, IST
 from src.db import init_db, save_signal, get_conn, get_paper_trades
 
@@ -50,6 +53,7 @@ class PaperTrader:
         symbols: list[str],
         config_path: str = "config.yaml",
         db_path: str = "data/kronos_options.db",
+        enable_weekly: bool = True,
     ):
         self.broker    = broker
         self.symbols   = symbols
@@ -61,6 +65,7 @@ class PaperTrader:
         self.mapper     = OptionsMapper(broker, config_path, db_path)
 
         init_db(db_path)
+        ensure_weekly_trades_table(db_path)
 
         pt_cfg = self.cfg.get("paper_trading", {})
         self.max_open  = pt_cfg.get("max_open_positions", 3)
@@ -72,7 +77,30 @@ class PaperTrader:
 
         self._open_positions: dict[str, dict] = {}  # symbol → trade rec
 
-    # ── Main loop ─────────────────────────────────────────────────────
+        # ── Weekly strategies ────────────────────────────────────────
+        wk_cfg = self.cfg.get("strategies", {}).get("weekly", {})
+        weekly_symbol = wk_cfg.get("symbol", symbols[0] if symbols else "NIFTY")
+        active = wk_cfg.get("active", ["default", "kronos"])
+
+        self.weekly_trader: Optional[WeeklyTrader] = None
+        if enable_weekly and wk_cfg.get("enabled", True):
+            self.weekly_trader = WeeklyTrader(
+                broker         = broker,
+                symbol         = weekly_symbol,
+                config_path    = config_path,
+                db_path        = db_path,
+                enable_default = "default" in active,
+                enable_kronos  = "kronos"  in active,
+                dry_run        = True,   # paper_trader is always paper
+            )
+            logger.info(
+                "WeeklyTrader attached | symbol=%s active=%s",
+                weekly_symbol, active,
+            )
+        else:
+            logger.info("WeeklyTrader disabled (enable_weekly=False or config disabled).")
+
+    # ── Main loop ────────────────────────────────────────────────────
 
     def run(self) -> None:
         logger.info("Paper trader started for: %s", self.symbols)
@@ -104,19 +132,26 @@ class PaperTrader:
         no_trade_until = dtime(9, 15 + self.no_trade_open)
         sq_off_time    = dtime(self.sq_off_h, self.sq_off_m)
 
-        # Square off all positions
+        # ─ Weekly strategies tick (runs on every tick, manages its own state) ─
+        if self.weekly_trader is not None:
+            try:
+                self.weekly_trader.tick(now)
+            except Exception as e:
+                logger.error("WeeklyTrader tick error: %s", e, exc_info=True)
+
+        # Square off all intraday positions
         if t >= sq_off_time:
             self._square_off_all(now)
             return
 
-        # Mark open positions to market
+        # Mark open intraday positions to market
         self._mark_to_market(now)
 
         if t < no_trade_until:
             logger.debug("Waiting for market to settle (before %s).", no_trade_until)
             return
 
-        # Process each symbol
+        # Process each symbol for intraday signals
         open_count = len(self._open_positions)
         for symbol in self.symbols:
             if open_count >= self.max_open:
@@ -175,7 +210,7 @@ class PaperTrader:
         except Exception as e:
             logger.error("Error processing %s: %s", symbol, e, exc_info=True)
 
-    # ── Position management ────────────────────────────────────────────
+    # ── Position management ──────────────────────────────────────────────
 
     def _open_paper_position(self, symbol: str, rec: dict, signal: dict, now: datetime) -> None:
         entry_premium = sum(
@@ -211,7 +246,7 @@ class PaperTrader:
         notify(f"New Signal: {symbol}", msg)
 
     def _square_off_all(self, now: datetime) -> None:
-        """Close all open positions at current prices."""
+        """Close all open intraday positions at current prices."""
         if not self._open_positions:
             return
         logger.info("Squaring off %d positions at %s.", len(self._open_positions), now.strftime("%H:%M"))
@@ -232,7 +267,7 @@ class PaperTrader:
         exit_premium = self._fetch_legs_premium(symbol, inst_key, legs, pos["expiry"])
 
         raw_pnl = (exit_premium - pos["entry_premium"]) * lot_size * lots * n_legs
-        charges = 20.0 * 2 * n_legs  # flat ₹20/order, entry + exit per leg
+        charges = 20.0 * 2 * n_legs
         net_pnl = raw_pnl - charges
 
         logger.info("PAPER TRADE CLOSE: %s %s | exit_prem=%.2f | net_pnl=₹%.0f | reason=%s",
@@ -255,11 +290,6 @@ class PaperTrader:
         legs: list[dict],
         expiry: str,
     ) -> float:
-        """
-        Fetch live LTP for each option leg from the option chain.
-        Returns net premium (BUY legs positive, SELL legs negative).
-        Falls back to entry LTP if chain fetch fails.
-        """
         try:
             chain = self.broker.get_option_chain(inst_key, expiry)
         except Exception:
@@ -268,7 +298,7 @@ class PaperTrader:
         net = 0.0
         for leg in legs:
             col = f"{leg['option_type']}_ltp"
-            ltp = leg.get("ltp", 0.0)  # fallback to entry price
+            ltp = leg.get("ltp", 0.0)
             if not chain.empty:
                 row = chain[chain["strike"] == leg["strike"]]
                 if not row.empty and col in row.columns:
@@ -279,7 +309,6 @@ class PaperTrader:
         return net
 
     def _mark_to_market(self, now: datetime) -> None:
-        """Log current unrealised P&L for all open positions."""
         for symbol, pos in self._open_positions.items():
             try:
                 inst_key = self.cfg["instruments"][symbol]["upstox_key"]
@@ -302,17 +331,22 @@ def main():
     setup_logging("paper_trader")
 
     parser = argparse.ArgumentParser(description="Kronos Options Paper Trader")
-    parser.add_argument("--symbols", nargs="+", default=["NIFTY", "BANKNIFTY", "SENSEX"])
+    parser.add_argument("--symbols",    nargs="+", default=["NIFTY", "BANKNIFTY", "SENSEX"])
+    parser.add_argument("--no-weekly",  action="store_true", help="Disable weekly strangle loop")
     args = parser.parse_args()
 
-    broker = get_broker()
+    broker  = get_broker()
     enabled = [s for s in args.symbols
                if load_config()["instruments"].get(s, {}).get("enabled", False)]
     if not enabled:
         logger.error("No enabled symbols found in config.")
         return
 
-    trader = PaperTrader(broker=broker, symbols=enabled)
+    trader = PaperTrader(
+        broker         = broker,
+        symbols        = enabled,
+        enable_weekly  = not args.no_weekly,
+    )
     trader.run()
 
 
