@@ -13,10 +13,12 @@ Two modes:
 
 On success:
   - Writes ZERODHA_ACCESS_TOKEN to .env (updates in-place)
+  - Saves today's NFO instruments snapshot to data/zerodha_instruments/
+    (used by the backtester for expired option token resolution)
   - Prints confirmation with token expiry time
 
 Prerequisites:
-  pip install kiteconnect pyotp python-dotenv
+  pip install kiteconnect pyotp python-dotenv requests
 """
 from __future__ import annotations
 
@@ -35,7 +37,7 @@ ENV_FILE = Path(".env")
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
-# ── .env helpers ─────────────────────────────────────────────────────
+# ── .env helpers ──────────────────────────────────────────────────────
 
 def _load_env() -> dict[str, str]:
     """Load .env file into a dict. Does not use dotenv to avoid side effects."""
@@ -75,10 +77,40 @@ def _update_env_token(new_token: str) -> None:
         content = content.rstrip("\n") + f"\n{replacement}\n"
 
     ENV_FILE.write_text(content, encoding="utf-8")
-    print(f"\u2705 ZERODHA_ACCESS_TOKEN updated in {ENV_FILE}")
+    print(f"✅ ZERODHA_ACCESS_TOKEN updated in {ENV_FILE}")
 
 
-# ── TOTP-based automated login ──────────────────────────────────────────
+# ── NFO instrument snapshot ───────────────────────────────────────────
+
+def _save_nfo_snapshot(api_key: str, access_token: str) -> None:
+    """
+    Save today's NFO instruments snapshot immediately after token refresh.
+    This snapshot is used by the backtester to resolve expired option tokens.
+    Skips silently if kiteconnect is unavailable or snapshot already exists.
+    """
+    try:
+        from src.broker.zerodha_historical import save_snapshot
+        from kiteconnect import KiteConnect
+
+        kite = KiteConnect(api_key=api_key)
+        kite.set_access_token(access_token)
+
+        today = datetime.now(IST).strftime("%Y-%m-%d")
+        print(f"\n📸 Saving NFO instrument snapshot for {today}...")
+        path = save_snapshot(kite, today)
+        print(f"   Snapshot saved → {path}")
+
+    except ImportError as e:
+        logger.warning("Snapshot skipped (import error): %s", e)
+        print(f"   ⚠️  Snapshot skipped: {e}")
+    except Exception as e:
+        # Non-fatal: token refresh succeeded, snapshot is best-effort
+        logger.warning("Snapshot save failed (non-fatal): %s", e)
+        print(f"   ⚠️  Snapshot save failed (non-fatal): {e}")
+        print("      Run manually: python -m src.broker.zerodha_historical --save-snapshot")
+
+
+# ── TOTP-based automated login ────────────────────────────────────────
 
 def _get_totp_code(totp_secret: str) -> str:
     """Generate current TOTP code using the secret."""
@@ -179,7 +211,7 @@ def _exchange_for_access_token(api_key: str, api_secret: str, request_token: str
     return access_token
 
 
-# ── Main ─────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────
 
 def main():
     logging.basicConfig(
@@ -195,9 +227,14 @@ def main():
             "Examples:\n"
             "  python zerodha_auth.py            # automated TOTP login\n"
             "  python zerodha_auth.py --manual   # browser-based login\n"
+            "  python zerodha_auth.py --no-snapshot  # skip NFO snapshot\n"
         ),
     )
     parser.add_argument("--manual", action="store_true", help="Use browser-based manual login")
+    parser.add_argument(
+        "--no-snapshot", action="store_true",
+        help="Skip saving NFO instrument snapshot (not recommended)"
+    )
     args = parser.parse_args()
 
     # Load credentials from .env
@@ -214,10 +251,8 @@ def main():
 
     try:
         if args.manual:
-            # Browser-based: user logs in manually
             request_token = _manual_login(api_key)
         else:
-            # Automated: requires TOTP secret + credentials in .env
             user_id     = env.get("ZERODHA_USER_ID", "").strip()
             password    = env.get("ZERODHA_PASSWORD", "").strip()
             totp_secret = env.get("ZERODHA_TOTP_SECRET", "").strip()
@@ -240,15 +275,21 @@ def main():
         print("\n🔄 Exchanging request_token for access_token...")
         access_token = _exchange_for_access_token(api_key, api_secret, request_token)
 
-        # Write to .env
+        # Write token to .env
         _update_env_token(access_token)
+
+        # Save NFO snapshot (unless --no-snapshot flag set)
+        if not args.no_snapshot:
+            _save_nfo_snapshot(api_key, access_token)
+        else:
+            print("   ⏭️  Snapshot skipped (--no-snapshot flag set)")
 
         # Show expiry info (tokens expire at 06:00 IST next day)
         now_ist = datetime.now(IST)
         expiry_ist = now_ist.replace(hour=6, minute=0, second=0, microsecond=0)
         if now_ist.hour >= 6:
             expiry_ist = expiry_ist + timedelta(days=1)
-        print(f"   Token valid until: {expiry_ist.strftime('%Y-%m-%d 06:00 IST')}")
+        print(f"\n   Token valid until: {expiry_ist.strftime('%Y-%m-%d 06:00 IST')}")
         print("\n✅ Done. You can now start the bot.")
 
     except KeyboardInterrupt:
