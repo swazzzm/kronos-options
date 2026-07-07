@@ -11,6 +11,12 @@ Models download from HuggingFace on first use:
     NeoQuasar/Kronos-Tokenizer-base  (~small)
     NeoQuasar/Kronos-small           (24.7M params, 512-token context)
 
+Fallback behaviour:
+    If PyTorch or Kronos is unavailable, the forecaster raises KronosUnavailableError
+    on every call (not RuntimeError), which the backtester catches and skips gracefully.
+    It does NOT permanently lock out — each call retries the import once so that a
+    successful pip-install mid-session is picked up.
+
 Usage:
     forecaster = KronosForecaster()
     result = forecaster.forecast("NIFTY", df_ohlcv, pred_len=12, samples=20)
@@ -31,30 +37,9 @@ from src.utils import load_config, IST
 
 logger = logging.getLogger(__name__)
 
-# ── Pre-flight torch check (emit ONE warning at import time, never per-bar) ──
-_TORCH_AVAILABLE = False
-_TORCH_WARN_EMITTED = False
 
-try:
-    import torch  # noqa: F401
-    _TORCH_AVAILABLE = True
-except ImportError:
-    pass
-
-
-def _warn_torch_once() -> None:
-    """Emit the torch-missing warning exactly once per process."""
-    global _TORCH_WARN_EMITTED
-    if not _TORCH_WARN_EMITTED:
-        logger.warning(
-            "PyTorch not found — Kronos AI forecasting is DISABLED. "
-            "Backtester will fall back to Black-Scholes signals.\n"
-            "  Fix: pip install torch torchvision torchaudio "
-            "--index-url https://download.pytorch.org/whl/cpu\n"
-            "  Then:  cd '%s' && pip install -r requirements.txt",
-            os.environ.get("KRONOS_REPO_PATH", "<KRONOS_REPO_PATH>"),
-        )
-        _TORCH_WARN_EMITTED = True
+class KronosUnavailableError(RuntimeError):
+    """Raised when Kronos / PyTorch is not installed or failed to load."""
 
 
 class KronosForecaster:
@@ -65,9 +50,8 @@ class KronosForecaster:
     distribution of future paths. Each call is stochastic (T=1.0, top_p<1).
     Model is loaded lazily on first forecast call.
 
-    If PyTorch is unavailable the forecaster raises RuntimeError on the first
-    call to forecast(), which the backtester catches and handles via its
-    Black-Scholes fallback — no per-bar log spam.
+    If PyTorch is absent the class raises KronosUnavailableError rather than
+    RuntimeError so callers can distinguish "skip this bar" from a hard crash.
     """
 
     def __init__(self, config_path: str = "config.yaml", db_path: str = "data/kronos_options.db"):
@@ -77,7 +61,8 @@ class KronosForecaster:
         self.cfg = load_config(config_path)
         self.db_path = db_path
         self._predictor = None
-        self._unavailable = False  # set True after first load failure to skip retries
+        self._load_attempted = False   # True after first load attempt
+        self._load_ok = False          # True only if load succeeded
         init_db(db_path)
 
         kcfg = self.cfg.get("kronos", {})
@@ -94,19 +79,23 @@ class KronosForecaster:
     # ── Model loading ──────────────────────────────────────────────────
 
     def _load_model(self) -> None:
-        """Load Kronos-small + Tokenizer. Called once on first forecast."""
-        if self._predictor is not None:
+        """
+        Load Kronos-small + Tokenizer. Called on every forecast if not yet loaded.
+        Raises KronosUnavailableError (never RuntimeError) so callers can catch it cleanly.
+        Does NOT permanently lock out — retries on each call until success so that
+        a mid-session pip-install is picked up without restarting.
+        """
+        if self._load_ok and self._predictor is not None:
             return
-        if self._unavailable:
-            raise RuntimeError("Kronos unavailable (previous load failed — see earlier warning).")
 
-        # Gate on torch before attempting any imports
-        if not _TORCH_AVAILABLE:
-            _warn_torch_once()
-            self._unavailable = True
-            raise RuntimeError(
+        # Check PyTorch first — give a clear actionable message
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            raise KronosUnavailableError(
                 "PyTorch not installed. Install with:\n"
-                "  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu"
+                "  pip install torch torchvision torchaudio "
+                "--index-url https://download.pytorch.org/whl/cpu"
             )
 
         logger.info(
@@ -120,18 +109,21 @@ class KronosForecaster:
         try:
             from model import Kronos, KronosTokenizer, KronosPredictor  # type: ignore[import]
         except ImportError as e:
-            self._unavailable = True
-            raise ImportError(
+            raise KronosUnavailableError(
                 f"Cannot import Kronos from {self.kronos_path}.\n"
                 f"Run: cd {self.kronos_path} && pip install -r requirements.txt\n"
                 f"Error: {e}"
             )
 
-        tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
-        model     = Kronos.from_pretrained("NeoQuasar/Kronos-small")
-        self._predictor = KronosPredictor(model, tokenizer, max_context=512)
+        try:
+            tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
+            model     = Kronos.from_pretrained("NeoQuasar/Kronos-small")
+            self._predictor = KronosPredictor(model, tokenizer, max_context=512)
+        except Exception as e:
+            raise KronosUnavailableError(f"Kronos model load failed: {e}") from e
 
-        logger.info("Kronos-small loaded.")
+        self._load_ok = True
+        logger.info("Kronos-small loaded successfully.")
 
     # ── Forecast ───────────────────────────────────────────────────────
 
@@ -153,6 +145,9 @@ class KronosForecaster:
             lookback: Number of input bars (default: from config; Kronos auto-truncates at 512 tokens)
             pred_len: Forecast horizon in bars (default: from config)
             samples:  Number of stochastic paths to generate (default: from config)
+
+        Raises:
+            KronosUnavailableError: if PyTorch / Kronos is not installed.
 
         Returns dict:
             median_path:       pd.DataFrame of predicted OHLCV (pred_len rows)
@@ -191,7 +186,8 @@ class KronosForecaster:
                 logger.debug("Cache hit for %s (hash %s…)", symbol, input_hash[:8])
                 return self._deserialise_cached(cached, current_close)
 
-        self._load_model()  # raises RuntimeError if torch/Kronos unavailable
+        # May raise KronosUnavailableError — caller decides whether to skip or abort
+        self._load_model()
 
         sample_paths = self._run_kronos(input_df, pred_len, samples)
 
@@ -288,7 +284,7 @@ class KronosForecaster:
                 logger.warning("Kronos sample %d/%d failed: %s — skipping", i + 1, samples, e)
 
         if not all_paths:
-            raise RuntimeError("All Kronos samples failed.")
+            raise KronosUnavailableError("All Kronos samples failed — check model installation.")
 
         return np.array(all_paths)  # (samples, pred_len)
 
