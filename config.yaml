@@ -3,24 +3,20 @@
 #  Credentials go in .env ONLY. Never hardcode tokens here.
 # ══════════════════════════════════════════════════════════════════════
 
-# ── Instruments ───────────────────────────────────────────────────────────
-# zerodha_symbol must match the tradingsymbol used in Kite (instruments CSV "name" field).
-# upstox_key retained for backtester compatibility but not used in live broker.
+# ── Instruments ────────────────────────────────────────────────────────
 instruments:
   NIFTY:
-    upstox_key: "NSE_INDEX|Nifty 50"
+    upstox_key: "NSE_INDEX|Nifty 50"   # kept for reference; not used with Zerodha
     zerodha_symbol: "NIFTY 50"
-    zerodha_name: "NIFTY"       # matches instruments CSV 'name' column for NFO lookup
-    atm_step: 50
-    lot_size: 75
+    atm_step: 50            # Strike rounding granularity
+    lot_size: 75            # Current lot size — verified 2026; fetch_lot_size: true to override
     exchange: "NSE"
-    expiry_day: "Thursday"
+    expiry_day: "Thursday"  # Weekly expiry
     enabled: true
 
   BANKNIFTY:
-    upstox_key: "NSE_INDEX|Nifty Bank"
+    upstox_key: "NSE_INDEX|Nifty Bank"  # kept for reference; not used with Zerodha
     zerodha_symbol: "NIFTY BANK"
-    zerodha_name: "BANKNIFTY"
     atm_step: 100
     lot_size: 15
     exchange: "NSE"
@@ -28,163 +24,138 @@ instruments:
     enabled: true
 
   SENSEX:
-    upstox_key: "BSE_INDEX|SENSEX"
+    upstox_key: "BSE_INDEX|SENSEX"      # kept for reference; not used with Zerodha
     zerodha_symbol: "SENSEX"
-    zerodha_name: "SENSEX"
     atm_step: 100
     lot_size: 10
     exchange: "BSE"
     expiry_day: "Friday"
-    enabled: false   # Disabled by default; enable when BSE feed is confirmed
+    enabled: true
+    # ASSUMPTION: SENSEX volume is often zero in index feed — data_cleaner will handle this.
 
-# ── Broker ────────────────────────────────────────────────────────────
+# ── Broker ─────────────────────────────────────────────────────────────
 broker:
-  primary: "zerodha"           # CHANGED: Zerodha is now active broker
-  # upstox kept for backtester / historical data fallback
-  base_url: "https://api.upstox.com/v2"
-  request_delay_s: 0.35
+  primary: "zerodha"         # "zerodha" | "upstox"
+  base_url: "https://api.kite.trade"
+  request_delay_s: 0.35      # Polite rate-limiting between API calls
   timeout_s: 10
   max_retries: 3
   retry_backoff_s: 1.0
 
-# ── Kronos Model ──────────────────────────────────────────────────────────
+# ── Kronos Model ───────────────────────────────────────────────────────
 kronos:
-  model_size: "small"
-  repo_path: null            # Override here OR set KRONOS_REPO_PATH in .env
-  lookback: 400
-  pred_len: 12
-  samples: 5
-  temperature: 1.0
-  top_p: 0.9
-  cache_forecasts: true
-  cache_ttl_minutes: 5
+  model_size: "small"        # NeoQuasar/Kronos-small — 24.7M params, fits in 8 GB RAM on CPU
+  # Path to cloned https://github.com/shiyu-coder/Kronos repo
+  # Override here OR set KRONOS_REPO_PATH in .env (env var takes priority if both set)
+  repo_path: null            # e.g. "C:/path/to/Kronos"
+  lookback: 400              # Input bars fed to Kronos (auto-truncated to 512 tokens internally)
+  pred_len: 12               # Forecast horizon: 12 bars × 5 min = 60 min ahead
+  samples: 5                 # Number of stochastic prediction paths (predict() called once per sample)
+  temperature: 1.0           # Sampling temperature — higher = more variance in paths
+  top_p: 0.9                 # Nucleus sampling threshold
+  cache_forecasts: true      # Store in SQLite to avoid re-running same inputs
+  cache_ttl_minutes: 5       # Cached forecast expires after 5 min
 
-# ── Signal Engine ─────────────────────────────────────────────────────────
+# ── Signal Engine ──────────────────────────────────────────────────────
 signal:
-  strong_bullish_move_pct: 0.50
-  bullish_move_pct: 0.25
-  bearish_move_pct: -0.25
-  strong_bearish_move_pct: -0.50
-  prob_up_strong: 0.75
-  prob_up_directional: 0.65
-  prob_down_directional: 0.35
-  prob_down_strong: 0.25
-  high_dispersion_pct: 0.40
-  low_dispersion_pct: 0.20
-  high_iv_threshold: 20.0
-  low_iv_threshold: 12.0
+  # Directional signal thresholds (based on Kronos forecast summary stats)
+  strong_bullish_move_pct: 0.50    # Expected close move > +0.50% → STRONG_BULLISH
+  bullish_move_pct: 0.25           # Expected close move > +0.25% → BULLISH
+  bearish_move_pct: -0.25          # Expected close move < -0.25% → BEARISH
+  strong_bearish_move_pct: -0.50   # Expected close move < -0.50% → STRONG_BEARISH
 
-# ── Options Mapper ─────────────────────────────────────────────────────────
+  prob_up_strong: 0.75             # prob_up > 75% required for STRONG_BULLISH
+  prob_up_directional: 0.65        # prob_up > 65% required for BULLISH
+  prob_down_directional: 0.35      # prob_up < 35% → BEARISH
+  prob_down_strong: 0.25           # prob_up < 25% → STRONG_BEARISH
+
+  # Volatility/dispersion thresholds for neutral strategies
+  high_dispersion_pct: 0.40        # Path endpoint std > 0.40% of close → "volatile"
+  low_dispersion_pct: 0.20         # Path endpoint std < 0.20% of close → "tight"
+  high_iv_threshold: 20.0          # IV > 20 → "high IV" (favours selling premium)
+  low_iv_threshold: 12.0           # IV < 12 → "low IV" (favours buying premium)
+
+# ── Options Mapper ─────────────────────────────────────────────────────
 options:
   default_strategy:
-    STRONG_BULLISH: "buy_atm_ce"
+    STRONG_BULLISH: "buy_atm_ce"          # or "bull_call_spread"
     BULLISH: "bull_put_spread"
     NEUTRAL_HIGH_DISP_LOW_IV: "straddle"
     NEUTRAL_LOW_DISP_HIGH_IV: "iron_condor"
     BEARISH: "bear_call_spread"
-    STRONG_BEARISH: "buy_atm_pe"
-  spread_otm_strikes: 1
+    STRONG_BEARISH: "buy_atm_pe"          # or "bear_put_spread"
 
-# ── Strategies ───────────────────────────────────────────────────────────
-strategies:
+  spread_otm_strikes: 1   # Number of ATM steps away for the hedge leg of spreads
 
-  # ─ Weekly options-selling strategies ─────────────────────────────
-  weekly:
-    enabled: true
-    symbol: NIFTY                  # Instrument for weekly strategies
-    active:                        # Remove a name to disable that strategy
-      - default                    # DefaultShortStrangle: symmetric ATM, no forecast
-      - kronos                     # KronosSkewedStrangle: Kronos p10/p90 driven
-    entry_window:
-      start: "09:30"               # Don't enter before 09:30 (let gap settle)
-      end:   "10:00"               # Must enter before 10:00 or skip this week
-
-  # ─ Kronos skewed strangle tuning ───────────────────────────────
-  # These override the defaults in KronosSkewedStrangle._DEFAULTS.
-  # All values are optional; omit a key to keep the built-in default.
-  kronos_skewed:
-    ce_buffer_pct:        0.005    # shift CE 0.5% above Kronos p90
-    pe_buffer_pct:        0.005    # shift PE 0.5% below Kronos p10
-    high_disp_threshold:  2.0     # % dispersion above which extra width is added
-    extra_width_steps:    1       # extra ATM steps each side when high dispersion
-    min_premium_pts:      10.0    # skip if leg premium < ₹10 (too far OTM)
-    min_prob_up:          0.35    # skip if Kronos is too strongly directional
-    max_prob_up:          0.65
-    sl_multiplier:        2.0     # SL = entry_combined × 2
-    target_multiplier:    0.50    # Target = entry_combined × 0.5
-    max_loss_limit_rs:    8000.0  # hard max-loss filter before entry
-
-# ── Trading Session ─────────────────────────────────────────────────────────
+# ── Trading Session ────────────────────────────────────────────────────
 trading:
   timezone: "Asia/Kolkata"
   session_start: "09:15"
   session_end: "15:30"
-  no_trade_open_mins: 5
-  no_trade_close_mins: 15
-  square_off_time: "15:15"
-  skip_expiry_day: true
-  event_blackout_mins: 30
+  no_trade_open_mins: 5        # No trades 9:15–9:20 (price discovery chaos)
+  no_trade_close_mins: 15      # No new trades after 15:15
+  square_off_time: "15:15"     # Hard square-off for all paper/live positions
+  skip_expiry_day: true        # Skip weekly expiry — theta/gamma extreme
+  event_blackout_mins: 30      # No trades 30 min before/after events below
 
+# Calendar of known high-impact events (add new events here)
+# Format: YYYY-MM-DD: "Description"
 event_calendar:
+  # 2025 events
+  "2025-12-04": "RBI MPC Policy"
+  # 2026 events — add as announced
   "2026-02-05": "RBI MPC Policy"
   "2026-04-09": "RBI MPC Policy"
   "2026-06-09": "RBI MPC Policy"
-  "2026-08-07": "RBI MPC Policy"
-  "2026-10-07": "RBI MPC Policy"
-  "2026-01-26": "Republic Day Holiday"
-  "2026-08-15": "Independence Day Holiday"
-  "2026-10-02": "Gandhi Jayanti Holiday"
+  "2026-01-01": "New Year Holiday"
 
-# ── Transaction Costs (Zerodha, July 2026) ─────────────────────────────
+# ── Transaction Costs (Zerodha rate card, June 2026) ───────────────────
 costs:
-  brokerage_per_order: 20.0
-  stt_sell_options_pct: 0.05
-  exchange_txn_options_pct: 0.053
-  gst_pct: 18.0
-  sebi_turnover_pct: 0.0001
-  stamp_duty_buy_pct: 0.003
-  slippage_ticks: 1
+  brokerage_per_order: 20.0         # ₹20 flat per executed order (Zerodha)
+  stt_sell_options_pct: 0.05        # STT 0.05% on sell-side premium (options)
+  exchange_txn_options_pct: 0.053   # NSE/BSE exchange transaction charge
+  gst_pct: 18.0                     # GST on (brokerage + exchange fees)
+  sebi_turnover_pct: 0.0001         # ₹10 per crore (≈ 0.0001%)
+  stamp_duty_buy_pct: 0.003         # 0.003% on buy premium
+  slippage_ticks: 1                 # 1-tick slippage each side (conservative)
+  # ASSUMPTION: tick size = ₹0.05 for options < ₹100, ₹0.10 for options ≥ ₹100
 
-# ── Paper Trading ─────────────────────────────────────────────────────────
+# ── Paper Trading ──────────────────────────────────────────────────────
 paper_trading:
   enabled: true
   max_open_positions: 3
-  capital_per_trade: 50000
+  capital_per_trade: 50000     # ₹50,000 notional per paper trade
   lots: 1
-  notify_on_signal: true
+  notify_on_signal: true       # Desktop notification via plyer
 
-# ── Live Trading ─────────────────────────────────────────────────────────
-# SAFETY: requires LIVE_TRADING=true in .env + --live flag + typed confirmation
+# ── Live Trading ───────────────────────────────────────────────────────
+# SAFETY: live trading requires LIVE_TRADING=true in .env AND --live CLI flag
+# AND typed confirmation at startup. Never enable here.
 live_trading:
   enabled: false
   max_trades_per_day: 3
-  max_capital_total: 300000      # Hard ₹3L cap enforced by RiskManager
   max_capital_per_trade: 50000
-  max_daily_loss_rs: -5000
+  max_daily_loss_rs: -5000     # Hard kill-switch: stop trading if day P&L < -₹5000
   lots: 1
 
-# ── Risk Manager ─────────────────────────────────────────────────────────
-risk:
-  max_total_capital: 300000      # Same as live_trading.max_capital_total
-  max_capital_per_trade: 50000
-  max_daily_loss_rs: -5000
-
-# ── Database ──────────────────────────────────────────────────────────────
+# ── Database ───────────────────────────────────────────────────────────
 database:
   path: "data/kronos_options.db"
 
-# ── Logging ──────────────────────────────────────────────────────────────
+# ── Logging ────────────────────────────────────────────────────────────
 logging:
-  level: "INFO"
+  level: "INFO"          # DEBUG | INFO | WARNING | ERROR
   log_to_file: true
   log_dir: "logs/"
-  max_bytes: 10485760
+  max_bytes: 10485760    # 10 MB per log file
   backup_count: 5
 
-# ── Backtester ───────────────────────────────────────────────────────────
+# ── Backtester ─────────────────────────────────────────────────────────
 backtest:
+  # Uses Zerodha Kite Connect historical API for real option OHLC data.
+  # Black-Scholes fallback available when API data is missing.
   use_real_option_data: true
   bs_fallback_when_missing: true
-  iv_assumption_pct: 15.0
+  iv_assumption_pct: 15.0    # Used ONLY for Black-Scholes fallback
   default_start: "2026-05-01"
   default_end: "2026-06-09"
