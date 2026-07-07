@@ -2,8 +2,8 @@
 Data fetcher — wraps broker API, fetches and caches 5-min OHLCV bars.
 
 Key design decisions:
-- Always fetches in 1-min bars from Upstox, resamples to 5-min locally
-  (Upstox's 5-min endpoint sometimes has gaps; 1-min is more reliable).
+- Always fetches in 1-min bars from Zerodha/Kite, resamples to 5-min locally
+  (Kite's 5-min endpoint sometimes has gaps; 1-min is more reliable).
 - Caches raw CSVs in data/historical/ so you don't burn API calls on reruns.
 - For backtesting, call fetch_date_range(); for live, call fetch_latest_bars().
 
@@ -38,7 +38,7 @@ class DataFetcher:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     def _instrument_key(self, symbol: str) -> str:
-        """Return instrument key for the active broker (Upstox or Zerodha)."""
+        """Return instrument key for the active broker (Zerodha/Kite)."""
         return get_instrument_key(symbol, self.config_path)
 
     def _cache_path(self, symbol: str, resolution: str) -> Path:
@@ -65,7 +65,10 @@ class DataFetcher:
         if use_cache and cache_path.exists():
             existing = pd.read_csv(cache_path, index_col=0, parse_dates=True)
             if not existing.empty:
-                existing.index = pd.to_datetime(existing.index, utc=True).tz_convert(IST)
+                # Normalise index to DatetimeIndex — coerce bad values to NaT
+                existing.index = pd.to_datetime(existing.index, utc=True, errors="coerce")
+                existing = existing[~existing.index.isna()].sort_index()
+                existing.index = existing.index.tz_convert(IST)
 
         start_dt = datetime.strptime(start, "%Y-%m-%d").date()
         end_dt   = datetime.strptime(end,   "%Y-%m-%d").date()
@@ -101,9 +104,21 @@ class DataFetcher:
             logger.warning("No data returned for %s %s→%s", symbol, start, end)
             return pd.DataFrame()
 
-        # Slice to requested range
-        mask = (existing.index.date >= start_dt) & (existing.index.date <= end_dt)
-        return existing[mask].copy()
+        # Slice to requested range using timestamp comparison — avoids
+        # AttributeError when index is a plain Index rather than DatetimeIndex
+        existing.index = pd.to_datetime(existing.index, errors="coerce")
+        existing = existing[~existing.index.isna()].sort_index()
+
+        start_ts = pd.Timestamp(start_dt)
+        end_ts   = pd.Timestamp(end_dt) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+
+        # Timezone-aware comparison when index carries tz info
+        if getattr(existing.index, "tz", None) is not None:
+            start_ts = start_ts.tz_localize(existing.index.tz)
+            end_ts   = end_ts.tz_localize(existing.index.tz)
+
+        mask = (existing.index >= start_ts) & (existing.index <= end_ts)
+        return existing.loc[mask].copy()
 
     def _fetch_one_day(
         self,
@@ -162,7 +177,9 @@ class DataFetcher:
         cache_path = self._cache_path(symbol, resolution)
         if cache_path.exists():
             df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
-            df.index = pd.to_datetime(df.index, utc=True).tz_convert(IST)
+            df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
+            df = df[~df.index.isna()].sort_index()
+            df.index = df.index.tz_convert(IST)
         else:
             df = pd.DataFrame()
 
@@ -193,6 +210,7 @@ class DataFetcher:
         """
         instrument_key = self._instrument_key(symbol)
 
+        # Find nearest expiry on or after date_str if not provided
         if expiry is None:
             expiries = self.broker.get_expired_expiries(instrument_key)
             valid = [e for e in expiries if e >= date_str]
@@ -201,9 +219,11 @@ class DataFetcher:
                 return None
             expiry = sorted(valid)[0]
 
+        # Get option instrument key
         opt_key = self.broker.get_expired_option_key(instrument_key, expiry, strike, option_type)
 
         if opt_key is None:
+            # Try adjacent strikes
             atm_step = self.cfg["instruments"][symbol]["atm_step"]
             for adj in [atm_step, -atm_step, atm_step * 2, -atm_step * 2]:
                 opt_key = self.broker.get_expired_option_key(
@@ -217,6 +237,7 @@ class DataFetcher:
         if opt_key is None:
             return None
 
+        # Fetch 1-min candles for the day and pick the requested time
         candles = self.broker.get_expired_option_candles(opt_key, "1minute", date_str)
         for c in candles:
             if time_str in str(c[0]):
