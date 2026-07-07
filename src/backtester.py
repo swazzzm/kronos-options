@@ -34,7 +34,7 @@ import pandas as pd
 
 from src.broker.base import BrokerInterface
 from src.data_fetcher import DataFetcher
-from src.data_cleaner import clean, is_expiry_day
+from src.data_cleaner import clean, is_expiry_day, INDEX_SYMBOLS
 from src.forecaster import KronosForecaster, KronosUnavailableError
 from src.signal_engine import SignalEngine
 from src.options_mapper import OptionsMapper
@@ -96,8 +96,6 @@ class Backtester:
         self.signal_eng  = SignalEngine(config_path, db_path)
         self.mapper      = OptionsMapper(broker, config_path, db_path)
         init_db(db_path)
-
-        # Warn once if Kronos/PyTorch is missing — don't spam per bar
         self._kronos_warned = False
 
     def run(
@@ -109,21 +107,6 @@ class Backtester:
         signal_bar_interval: int = 6,
         lots: int = 1,
     ) -> dict:
-        """
-        Walk-forward backtest.
-
-        Args:
-            symbol:               NIFTY | BANKNIFTY | SENSEX
-            start / end:          Date range "YYYY-MM-DD"
-            bar_resolution:       Bar size (currently only "5min" tested)
-            signal_bar_interval:  How many bars between signal evaluations
-            lots:                 Number of lots per trade
-
-        Returns dict with:
-            trade_log:      pd.DataFrame of all trades
-            equity_curve:   pd.Series of running P&L
-            stats:          dict of performance metrics
-        """
         logger.info("Starting backtest: %s %s → %s", symbol, start, end)
 
         df_raw = self.fetcher.fetch_date_range(symbol, start, end, bar_resolution)
@@ -132,24 +115,32 @@ class Backtester:
         if df.empty:
             raise ValueError(f"No clean data for {symbol} {start}→{end}")
 
-        # Drop zero-volume bars (market closed / auction ticks) — warn once
-        zero_vol = (df["volume"] == 0).sum()
-        if zero_vol > 0:
-            logger.warning("%s: dropping %d zero-volume bars before backtest.", symbol, zero_vol)
-            df = df[df["volume"] > 0]
+        # Zero-volume bars: only drop for non-index equity symbols.
+        # Index feeds (NIFTY, BANKNIFTY …) legitimately have volume=0 always.
+        is_index = symbol.upper() in INDEX_SYMBOLS
+        if not is_index and "volume" in df.columns:
+            zero_vol = (df["volume"] == 0).sum()
+            if zero_vol > 0:
+                logger.warning("%s: dropping %d zero-volume bars before backtest.", symbol, zero_vol)
+                df = df[df["volume"] > 0]
+        elif is_index and "volume" in df.columns:
+            zero_vol = (df["volume"] == 0).sum()
+            if zero_vol > 0:
+                logger.info(
+                    "%s: %d zero-volume bars kept (index feed — volume not available).",
+                    symbol, zero_vol,
+                )
 
-        inst_cfg  = self.cfg["instruments"][symbol]
-        atm_step  = inst_cfg["atm_step"]
-        lot_size  = inst_cfg["lot_size"]
-        bt_cfg    = self.cfg.get("backtest", {})
-        tc_cfg    = self.cfg.get("trading", {})
-        skip_exp  = tc_cfg.get("skip_expiry_day", True)
-        use_real  = bt_cfg.get("use_real_option_data", True)
-        slippage  = self.cfg["costs"].get("slippage_ticks", 1)
-        lookback  = self.cfg["kronos"]["lookback"]
-
-        # Resolve instrument key via broker-agnostic helper
-        inst_key  = get_instrument_key(symbol, self.config_path)
+        inst_cfg = self.cfg["instruments"][symbol]
+        atm_step = inst_cfg["atm_step"]
+        lot_size = inst_cfg["lot_size"]
+        bt_cfg   = self.cfg.get("backtest", {})
+        tc_cfg   = self.cfg.get("trading", {})
+        skip_exp = tc_cfg.get("skip_expiry_day", True)
+        use_real = bt_cfg.get("use_real_option_data", True)
+        slippage = self.cfg["costs"].get("slippage_ticks", 1)
+        lookback = self.cfg["kronos"]["lookback"]
+        inst_key = get_instrument_key(symbol, self.config_path)
 
         trade_records = []
         equity        = 0.0
@@ -209,7 +200,6 @@ class Backtester:
                         forecast = self.forecaster.forecast(symbol, hist, use_cache=False)
                         signal   = self.signal_eng.generate(forecast, save_to_db=False)
                     except KronosUnavailableError as e:
-                        # Warn only once per run, then skip silently
                         if not self._kronos_warned:
                             logger.warning(
                                 "Kronos unavailable — skipping all forecast bars. "
@@ -347,10 +337,6 @@ class Backtester:
         return entry, exit_, "bs_approximation"
 
     def _bs_approximate(self, symbol, date_str, strike, opt_type, expiry):
-        """
-        Black-Scholes approximation when real option data is unavailable.
-        CAUTION: rough estimate only. Filter 'bs_approximation' trades from analysis.
-        """
         from scipy.stats import norm
         import math
 
