@@ -10,11 +10,61 @@ import argparse
 import sys
 from pathlib import Path
 
-# Run from project root
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.utils import get_broker, load_config, setup_logging
 from src.backtester import Backtester
+from src.forecaster import KronosUnavailableError, KronosForecaster
+
+
+def _check_kronos(config_path: str = "config.yaml") -> bool:
+    """Return True if Kronos can be imported and loaded, False otherwise."""
+    try:
+        fc = KronosForecaster(config_path)
+        return fc.available
+    except Exception:
+        return False
+
+
+def _prompt_bs_fallback() -> bool:
+    """
+    Ask the user whether to continue with Black-Scholes fallback or exit.
+    Returns True  → continue with BS fallback
+    Returns False → exit
+    """
+    print()
+    print("╔══════════════════════════════════════════════════════════════╗")
+    print("║              ⚠  KRONOS MODEL UNAVAILABLE  ⚠                 ║")
+    print("╠══════════════════════════════════════════════════════════════╣")
+    print("║  The Kronos forecasting model could not be loaded.           ║")
+    print("║                                                              ║")
+    print("║  Likely cause:  missing Python packages.                     ║")
+    print("║  Fix:  cd \"C:\\Users\\swazz\\Downloads\\VS Codes\\Kronos\"        ║")
+    print("║        pip install -r requirements.txt                       ║")
+    print("║        pip install huggingface_hub transformers              ║")
+    print("║                                                              ║")
+    print("║  Options:                                                    ║")
+    print("║    [1] Continue with Black-Scholes fallback (less accurate)  ║")
+    print("║    [2] Exit and fix Kronos first (recommended)               ║")
+    print("╚══════════════════════════════════════════════════════════════╝")
+    print()
+
+    while True:
+        choice = input("  Enter 1 or 2: ").strip()
+        if choice == "1":
+            print()
+            print("  ▶ Running in Black-Scholes fallback mode.")
+            print("  ⚠  Results will be less accurate than Kronos-based signals.")
+            print("  ⚠  All trades tagged 'bs_approximation' in the trade log.")
+            print()
+            return True
+        elif choice == "2":
+            print()
+            print("  Exiting. Please install Kronos dependencies and retry.")
+            print()
+            return False
+        else:
+            print("  Invalid input. Please enter 1 or 2.")
 
 
 def main():
@@ -25,17 +75,36 @@ def main():
     default_end   = cfg.get("backtest", {}).get("default_end",   "2025-12-31")
 
     parser = argparse.ArgumentParser(description="Kronos Options Backtester")
-    parser.add_argument("--symbol", default="NIFTY",      choices=["NIFTY", "BANKNIFTY", "SENSEX"])
+    parser.add_argument("--symbol", default="NIFTY",       choices=["NIFTY", "BANKNIFTY", "SENSEX"])
     parser.add_argument("--start",  default=default_start, help="Start date YYYY-MM-DD")
     parser.add_argument("--end",    default=default_end,   help="End date YYYY-MM-DD")
-    parser.add_argument("--lots",   type=int, default=1,  help="Number of lots per trade")
+    parser.add_argument("--lots",   type=int, default=1,   help="Number of lots per trade")
+    parser.add_argument(
+        "--bs-fallback", action="store_true",
+        help="Skip Kronos check and run straight in Black-Scholes mode (non-interactive)"
+    )
     args = parser.parse_args()
 
     print(f"\nBacktest: {args.symbol}  {args.start} → {args.end}  lots={args.lots}\n")
 
+    # ── Kronos availability check ──────────────────────────────────────────────
+    if args.bs_fallback:
+        # User explicitly asked for BS mode — skip the prompt
+        print("  [--bs-fallback] Black-Scholes mode active (Kronos skipped).\n")
+        use_kronos = False
+    else:
+        use_kronos = _check_kronos()
+        if not use_kronos:
+            proceed = _prompt_bs_fallback()
+            if not proceed:
+                sys.exit(0)
+
+    # ── Run backtest ───────────────────────────────────────────────────────────
     broker = get_broker()
     bt     = Backtester(broker=broker)
-    result = bt.run(args.symbol, args.start, args.end, lots=args.lots)
+
+    # Pass use_kronos flag so backtester can skip forecast entirely if False
+    result = bt.run(args.symbol, args.start, args.end, lots=args.lots, use_kronos=use_kronos)
 
     stats = result["stats"]
     print("\n── Results ─────────────────────────────────────")
