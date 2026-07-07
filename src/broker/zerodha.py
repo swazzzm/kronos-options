@@ -1,25 +1,30 @@
 """
 Zerodha Kite Connect v3 broker implementation.
-Swap broker.primary to "zerodha" in config.yaml to activate.
 
-Prerequisites:
-  1. pip install kiteconnect pyotp
-  2. Set in .env:
-       ZERODHA_API_KEY=your_api_key
-       ZERODHA_API_SECRET=your_api_secret
-       ZERODHA_ACCESS_TOKEN=your_access_token   # refreshed daily via zerodha_auth.py
+Setup:
+  1. pip install kiteconnect
+  2. In .env:
+       ZERODHA_API_KEY=xxxx
+       ZERODHA_API_SECRET=xxxx
+       ZERODHA_ACCESS_TOKEN=xxxx   # refresh daily via login flow
+  3. In config.yaml: broker.primary: "zerodha"
 
-Note on instrument tokens:
-  Zerodha uses integer instrument_token, not string keys.
-  All methods accept either the string symbol (e.g. "NIFTY") or an integer token.
-  Option chain lookup returns instrument_token in each row for order placement.
+Access token must be refreshed every day.
+Use the login helper:
+    python -m src.broker.zerodha_login
+
+Notes on instrument keys:
+  Zerodha uses integer instrument_tokens, not string keys.
+  This broker resolves string keys ("NIFTY 50", "NIFTY26JUL24750CE") → tokens
+  via instruments CSV cached daily in data/zerodha_instruments.csv.
 """
 from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timedelta
-from typing import Optional
+from datetime import datetime, date
+from pathlib import Path
+from typing import Optional, List
 
 import pandas as pd
 
@@ -27,91 +32,131 @@ from .base import BrokerInterface
 
 logger = logging.getLogger(__name__)
 
-# Zerodha exchange + segment constants
-_EXCHANGE_NFO = "NFO"       # options & futures
-_EXCHANGE_NSE = "NSE"       # equity
-_INDEX_TOKEN_MAP = {
-    "NIFTY":     256265,
-    "BANKNIFTY": 260105,
-    "SENSEX":    265,
+_INSTRUMENTS_CACHE_PATH = Path("data/zerodha_instruments.csv")
+_INTERVAL_MAP = {
+    "1minute":  "minute",
+    "5minute":  "5minute",
+    "15minute": "15minute",
+    "30minute": "30minute",
+    "60minute": "60minute",
+    "day":      "day",
 }
 
 
 class ZerodhaBroker(BrokerInterface):
     """
-    Full Zerodha Kite Connect v3 implementation.
-    All methods match the BrokerInterface contract defined in base.py.
+    Zerodha Kite Connect v3 implementation.
+    Broker primary = "zerodha" in config.yaml.
     """
 
     def __init__(self, api_key: str, access_token: str):
         try:
             from kiteconnect import KiteConnect
         except ImportError:
-            raise ImportError("Run: pip install kiteconnect")
-
+            raise ImportError(
+                "kiteconnect not installed. Run: pip install kiteconnect"
+            )
         self.kite = KiteConnect(api_key=api_key)
         self.kite.set_access_token(access_token)
-        self._instruments_cache: Optional[pd.DataFrame] = None
-        self._instruments_fetched_date: Optional[str] = None
-        logger.info("ZerodhaBroker initialised with api_key=%s...", api_key[:6])
+        self._instruments_df: Optional[pd.DataFrame] = None
+        logger.info("ZerodhaBroker initialised.")
 
-    # ── Instruments cache ──────────────────────────────────────────────
+    # ── Instruments CSV (cached daily) ─────────────────────────────────
 
-    def _get_instruments(self, exchange: str = "NFO") -> pd.DataFrame:
-        """Fetch and cache NFO instruments list (refreshed once per trading day)."""
-        today = datetime.now().strftime("%Y-%m-%d")
-        if self._instruments_cache is not None and self._instruments_fetched_date == today:
-            return self._instruments_cache
+    def _load_instruments(self, refresh: bool = False) -> pd.DataFrame:
+        """
+        Load NSE/NFO instruments from Zerodha or from daily cache.
+        Refresh happens once per day automatically.
+        """
+        if self._instruments_df is not None and not refresh:
+            return self._instruments_df
 
-        logger.info("Fetching instruments list from Zerodha (exchange=%s)...", exchange)
-        raw = self.kite.instruments(exchange=exchange)
-        df = pd.DataFrame(raw)
-        self._instruments_cache = df
-        self._instruments_fetched_date = today
+        today = date.today().isoformat()
+        if _INSTRUMENTS_CACHE_PATH.exists():
+            mtime = datetime.fromtimestamp(_INSTRUMENTS_CACHE_PATH.stat().st_mtime).date()
+            if mtime.isoformat() == today and not refresh:
+                self._instruments_df = pd.read_csv(_INSTRUMENTS_CACHE_PATH)
+                logger.debug("Instruments loaded from cache (%d rows).", len(self._instruments_df))
+                return self._instruments_df
+
+        logger.info("Downloading fresh instruments CSV from Zerodha...")
+        _INSTRUMENTS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        instruments = self.kite.instruments("NFO") + self.kite.instruments("NSE")
+        df = pd.DataFrame(instruments)
+        df.to_csv(_INSTRUMENTS_CACHE_PATH, index=False)
+        self._instruments_df = df
+        logger.info("Instruments refreshed: %d rows saved.", len(df))
         return df
 
-    def _resolve_token(self, symbol: str) -> int:
-        """Resolve index symbol to Zerodha instrument_token."""
-        symbol = symbol.upper()
-        if symbol in _INDEX_TOKEN_MAP:
-            return _INDEX_TOKEN_MAP[symbol]
-        # Try NSE equity lookup
-        instruments = self._get_instruments("NSE")
-        row = instruments[instruments["tradingsymbol"] == symbol]
+    def _resolve_token(self, tradingsymbol: str, exchange: str = "NFO") -> Optional[int]:
+        """Resolve tradingsymbol string → instrument_token (int)."""
+        df = self._load_instruments()
+        row = df[(df["tradingsymbol"] == tradingsymbol) & (df["exchange"] == exchange)]
         if row.empty:
-            raise ValueError(f"Cannot resolve instrument token for symbol: {symbol}")
+            logger.warning("Token not found for %s:%s", exchange, tradingsymbol)
+            return None
         return int(row.iloc[0]["instrument_token"])
 
-    # ── Market data ────────────────────────────────────────────────────
+    def _index_token(self, zerodha_symbol: str) -> Optional[int]:
+        """Resolve index symbol (e.g. 'NIFTY 50') → token via NSE exchange."""
+        df = self._load_instruments()
+        row = df[(df["tradingsymbol"] == zerodha_symbol) & (df["exchange"] == "NSE")]
+        if not row.empty:
+            return int(row.iloc[0]["instrument_token"])
+        # Fallback: use kite.ltp()
+        try:
+            resp = self.kite.ltp([f"NSE:{zerodha_symbol}"])
+            return resp[f"NSE:{zerodha_symbol}"]["instrument_token"]
+        except Exception as e:
+            logger.error("Could not resolve index token for %s: %s", zerodha_symbol, e)
+            return None
+
+    # ── Key format helpers ────────────────────────────────────────────
+
+    @staticmethod
+    def _build_option_symbol(
+        underlying: str,    # "NIFTY" | "BANKNIFTY" | "SENSEX"
+        expiry: str,        # "YYYY-MM-DD"
+        strike: int,
+        option_type: str,   # "CE" | "PE"
+    ) -> str:
+        """
+        Build Zerodha NFO tradingsymbol for a weekly option.
+        Format: NIFTY26JUL24750CE  (SYMBOL + YY + MON + STRIKE + CE/PE)
+        Monthly: NIFTY26JUL24750CE is the same; weekly adds day for near-term.
+
+        Zerodha weekly format (non-month-end): NIFTY2571024750CE
+        i.e.  NIFTY + YY + MM + DD + STRIKE + CE/PE
+        """
+        d = datetime.strptime(expiry, "%Y-%m-%d")
+        # Check if it's the last Thursday of the month (monthly expiry)
+        import calendar
+        last_thu = max(
+            week[3] for week in calendar.monthcalendar(d.year, d.month)
+            if week[3] != 0
+        )
+        if d.day == last_thu:
+            # Monthly format: NIFTY26JUL24750CE
+            return f"{underlying}{d.strftime('%y%b').upper()}{strike}{option_type}"
+        else:
+            # Weekly format: NIFTY2571024750CE (yy + single-digit M + DD)
+            month_char = "123456789OND"[d.month - 1]   # Zerodha: Oct=O, Nov=N, Dec=D
+            return f"{underlying}{d.strftime('%y')}{month_char}{d.strftime('%d')}{strike}{option_type}"
+
+    # ── BrokerInterface implementation ────────────────────────────────
 
     def get_historical_candles(
         self,
-        instrument_key: str,
+        instrument_key: str,   # zerodha_symbol e.g. "NIFTY 50"
         interval: str,
         from_date: str,
         to_date: str,
     ) -> pd.DataFrame:
-        """
-        Fetch OHLCV candles from Zerodha historical data API.
-        instrument_key: symbol string (e.g. 'NIFTY') or integer token as string.
-        interval: '1minute' | '5minute' | '15minute' | '30minute' | '60minute' | 'day'
-        """
-        try:
-            token = int(instrument_key)
-        except ValueError:
-            token = self._resolve_token(instrument_key)
+        token = self._index_token(instrument_key)
+        if token is None:
+            raise ValueError(f"Could not resolve token for {instrument_key}")
 
-        # Kite interval mapping
-        interval_map = {
-            "1minute":  "minute",
-            "5minute":  "5minute",
-            "15minute": "15minute",
-            "30minute": "30minute",
-            "60minute": "60minute",
-            "day":      "day",
-        }
-        kite_interval = interval_map.get(interval, interval)
-
+        kite_interval = _INTERVAL_MAP.get(interval, interval)
         data = self.kite.historical_data(
             instrument_token=token,
             from_date=from_date,
@@ -123,32 +168,33 @@ class ZerodhaBroker(BrokerInterface):
         df = pd.DataFrame(data)
         if df.empty:
             return df
-        df.rename(columns={"date": "timestamp"}, inplace=True)
-        df.set_index("timestamp", inplace=True)
-        df.index = pd.to_datetime(df.index, utc=False)
-        return df[["open", "high", "low", "close", "volume"]]
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").rename(columns={
+            "open": "open", "high": "high", "low": "low",
+            "close": "close", "volume": "volume",
+        })
+        if df.index.tz is None:
+            import pytz
+            df.index = df.index.tz_localize(pytz.timezone("Asia/Kolkata"))
+        return df
 
     def get_expired_expiries(self, instrument_key: str) -> list[str]:
         """
-        Return sorted list of past weekly expiry dates for NIFTY/BANKNIFTY.
-        Uses NFO instruments CSV to find distinct expiry dates for options contracts.
+        Return past + upcoming expiry dates for the underlying.
+        Pulls from NFO instruments CSV and returns sorted unique expiry strings.
+        instrument_key: zerodha_symbol like 'NIFTY 50' or bare 'NIFTY'.
         """
-        symbol = instrument_key.upper().replace("_INDEX", "")
-        instruments = self._get_instruments("NFO")
-        options = instruments[
-            (instruments["name"] == symbol) &
-            (instruments["instrument_type"].isin(["CE", "PE"]))
+        underlying = instrument_key.split()[0]   # 'NIFTY 50' → 'NIFTY'
+        df = self._load_instruments()
+        rows = df[
+            (df["name"] == underlying) &
+            (df["exchange"] == "NFO") &
+            (df["instrument_type"].isin(["CE", "PE"]))
         ]
-        if options.empty:
-            logger.warning("No instruments found for %s in NFO", symbol)
+        if rows.empty:
             return []
-
-        today = datetime.now().date()
-        options = options.copy()
-        options["expiry"] = pd.to_datetime(options["expiry"])
-        past = options[options["expiry"].dt.date < today]
-        expiries = sorted(past["expiry"].dt.strftime("%Y-%m-%d").unique().tolist())
-        return expiries
+        expiries = pd.to_datetime(rows["expiry"]).dt.date.unique()
+        return sorted(str(e) for e in expiries)
 
     def get_expired_option_key(
         self,
@@ -157,195 +203,191 @@ class ZerodhaBroker(BrokerInterface):
         strike: int,
         option_type: str,
     ) -> Optional[str]:
-        """
-        Return instrument_token (as string) for an expired option contract.
-        Returns None if not found in instruments cache.
-        """
-        symbol = instrument_key.upper().replace("_INDEX", "")
-        instruments = self._get_instruments("NFO")
-        mask = (
-            (instruments["name"] == symbol) &
-            (instruments["instrument_type"] == option_type.upper()) &
-            (instruments["strike"] == float(strike)) &
-            (pd.to_datetime(instruments["expiry"]).dt.strftime("%Y-%m-%d") == expiry)
-        )
-        matched = instruments[mask]
-        if matched.empty:
-            return None
-        return str(int(matched.iloc[0]["instrument_token"]))
+        """Return tradingsymbol string for the given option contract."""
+        underlying = instrument_key.split()[0]
+        return self._build_option_symbol(underlying, expiry, strike, option_type)
 
     def get_expired_option_candles(
         self,
-        expired_option_key: str,
+        expired_option_key: str,   # tradingsymbol e.g. "NIFTY2571024750CE"
         interval: str,
         date_str: str,
     ) -> list:
-        """Return raw candle list for an expired option on a given date."""
-        df = self.get_historical_candles(
-            instrument_key=expired_option_key,
-            interval=interval,
-            from_date=date_str,
-            to_date=date_str,
-        )
-        if df.empty:
+        token = self._resolve_token(expired_option_key, exchange="NFO")
+        if token is None:
             return []
-        df.reset_index(inplace=True)
-        return df.to_dict(orient="records")
+        kite_interval = _INTERVAL_MAP.get(interval, interval)
+        try:
+            return self.kite.historical_data(
+                instrument_token=token,
+                from_date=date_str,
+                to_date=date_str,
+                interval=kite_interval,
+            )
+        except Exception as e:
+            logger.error("get_expired_option_candles failed for %s: %s", expired_option_key, e)
+            return []
 
     def get_option_chain(
         self,
-        instrument_key: str,
-        expiry: str,
+        instrument_key: str,   # zerodha_symbol like "NIFTY 50"
+        expiry: str,           # "YYYY-MM-DD"
     ) -> pd.DataFrame:
         """
-        Return live option chain for given symbol and expiry.
-        Columns: strike, instrument_type, instrument_token, ltp, iv, oi, volume
+        Build a synthetic option chain by fetching LTP for all strikes.
+        Returns DataFrame with columns: strike, CE_ltp, PE_ltp, instrument_type.
         """
-        symbol = instrument_key.upper().replace("_INDEX", "")
-        instruments = self._get_instruments("NFO")
-        mask = (
-            (instruments["name"] == symbol) &
-            (instruments["instrument_type"].isin(["CE", "PE"])) &
-            (pd.to_datetime(instruments["expiry"]).dt.strftime("%Y-%m-%d") == expiry)
-        )
-        chain_instruments = instruments[mask].copy()
-        if chain_instruments.empty:
-            logger.warning("No option chain data for %s expiry=%s", symbol, expiry)
+        underlying = instrument_key.split()[0]
+        expiry_date = datetime.strptime(expiry, "%Y-%m-%d").date()
+
+        df_inst = self._load_instruments()
+        rows = df_inst[
+            (df_inst["name"] == underlying) &
+            (df_inst["exchange"] == "NFO") &
+            (pd.to_datetime(df_inst["expiry"]).dt.date == expiry_date)
+        ].copy()
+
+        if rows.empty:
+            logger.warning("No instruments found for %s expiry=%s", underlying, expiry)
             return pd.DataFrame()
 
-        tokens = chain_instruments["instrument_token"].astype(int).tolist()
-        # Zerodha quote accepts max 500 instruments per call
-        quotes = {}
-        for i in range(0, len(tokens), 500):
-            batch = tokens[i:i+500]
-            q = self.kite.quote(instruments=batch)
-            quotes.update(q)
+        # Build LTP request: max 500 instruments per call (Kite limit)
+        symbols = [f"NFO:{row['tradingsymbol']}" for _, row in rows.iterrows()]
+        ltps = {}
+        for i in range(0, len(symbols), 500):
+            chunk = symbols[i:i + 500]
+            try:
+                resp = self.kite.ltp(chunk)
+                ltps.update(resp)
+            except Exception as e:
+                logger.warning("LTP batch failed: %s", e)
 
-        rows = []
-        for _, row in chain_instruments.iterrows():
-            token = str(int(row["instrument_token"]))
-            q = quotes.get(token, {})
-            rows.append({
-                "strike":           row["strike"],
-                "instrument_type":  row["instrument_type"],
-                "instrument_token": int(row["instrument_token"]),
-                "tradingsymbol":    row["tradingsymbol"],
-                "ltp":              q.get("last_price", 0.0),
-                "iv":               q.get("implied_volatility", 0.0),
-                "oi":               q.get("oi", 0),
-                "volume":           q.get("volume", 0),
+        records = []
+        for _, row in rows.iterrows():
+            sym_key = f"NFO:{row['tradingsymbol']}"
+            ltp_val = ltps.get(sym_key, {}).get("last_price", 0.0)
+            records.append({
+                "strike":          int(row["strike"]),
+                "instrument_type": row["instrument_type"],   # "CE" or "PE"
+                "tradingsymbol":   row["tradingsymbol"],
+                "ltp":             float(ltp_val),
             })
 
-        return pd.DataFrame(rows).sort_values("strike").reset_index(drop=True)
+        chain_df = pd.DataFrame(records)
+        if chain_df.empty:
+            return chain_df
+
+        # Pivot to wide format: strike, CE_ltp, PE_ltp
+        ce = chain_df[chain_df["instrument_type"] == "CE"][["strike", "ltp"]].rename(columns={"ltp": "CE_ltp"})
+        pe = chain_df[chain_df["instrument_type"] == "PE"][["strike", "ltp"]].rename(columns={"ltp": "PE_ltp"})
+        wide = pd.merge(ce, pe, on="strike", how="outer").sort_values("strike").reset_index(drop=True)
+        # Also keep long format cols for compatibility with strategies that use instrument_type/ltp
+        wide["_raw"] = None   # marker; raw data accessible via chain_df if needed
+        return wide
 
     def get_live_quote(self, instrument_key: str) -> dict:
-        """Return latest quote for a symbol or instrument token."""
+        """
+        instrument_key: zerodha_symbol like 'NIFTY 50'
+        Returns dict with ltp, open, high, low, close, volume.
+        """
+        kite_key = f"NSE:{instrument_key}"
         try:
-            token = int(instrument_key)
-        except ValueError:
-            token = self._resolve_token(instrument_key)
+            resp = self.kite.quote([kite_key])
+            q = resp[kite_key]
+            ohlc = q.get("ohlc", {})
+            return {
+                "ltp":    float(q.get("last_price", 0)),
+                "open":   float(ohlc.get("open", 0)),
+                "high":   float(ohlc.get("high", 0)),
+                "low":    float(ohlc.get("low", 0)),
+                "close":  float(ohlc.get("close", 0)),
+                "volume": int(q.get("volume", 0)),
+            }
+        except Exception as e:
+            logger.error("get_live_quote failed for %s: %s", instrument_key, e)
+            return {"ltp": 0.0, "open": 0.0, "high": 0.0, "low": 0.0, "close": 0.0, "volume": 0}
 
-        quotes = self.kite.quote(instruments=[token])
-        q = quotes.get(str(token), {})
-        return {
-            "ltp":    q.get("last_price", 0.0),
-            "open":   q.get("ohlc", {}).get("open", 0.0),
-            "high":   q.get("ohlc", {}).get("high", 0.0),
-            "low":    q.get("ohlc", {}).get("low", 0.0),
-            "close":  q.get("ohlc", {}).get("close", 0.0),
-            "volume": q.get("volume", 0),
-        }
-
-    # ── Order management ──────────────────────────────────────────────
+    def get_ltp(self, instrument_keys: List[str]) -> dict:
+        """
+        Batched LTP fetch. instrument_keys: list of zerodha_symbol strings.
+        Returns {key: ltp}.
+        """
+        kite_keys = [f"NSE:{k}" if ":" not in k else k for k in instrument_keys]
+        try:
+            resp = self.kite.ltp(kite_keys)
+            return {
+                k: float(resp.get(f"NSE:{k}", resp.get(k, {})).get("last_price", 0.0))
+                for k in instrument_keys
+            }
+        except Exception as e:
+            logger.warning("Batched LTP failed: %s — falling back to per-key.", e)
+            return super().get_ltp(instrument_keys)
 
     def place_order(
         self,
-        instrument_key: str,
+        instrument_key: str,   # tradingsymbol, e.g. "NIFTY2571024750CE"
         transaction_type: str,
         quantity: int,
         order_type: str,
         price: float = 0.0,
         tag: str = "",
     ) -> str:
-        """
-        Place order on Zerodha via Kite Connect.
-        instrument_key: integer instrument_token as string (from get_option_chain).
-        transaction_type: "BUY" or "SELL".
-        order_type: "MARKET" or "LIMIT".
-        Returns Zerodha order_id as string.
-        """
         from kiteconnect import KiteConnect
-
-        kite_txn = (
-            self.kite.TRANSACTION_TYPE_BUY
-            if transaction_type.upper() == "BUY"
-            else self.kite.TRANSACTION_TYPE_SELL
-        )
+        exchange = "NFO" if any(x in instrument_key for x in ["CE", "PE"]) else "NSE"
         kite_order_type = (
-            self.kite.ORDER_TYPE_MARKET
-            if order_type.upper() == "MARKET"
-            else self.kite.ORDER_TYPE_LIMIT
+            KiteConnect.ORDER_TYPE_MARKET if order_type == "MARKET"
+            else KiteConnect.ORDER_TYPE_LIMIT
         )
-
-        # Resolve tradingsymbol from instrument_token for NFO orders
-        instruments = self._get_instruments("NFO")
-        row = instruments[instruments["instrument_token"] == int(instrument_key)]
-        if row.empty:
-            raise ValueError(f"Instrument token {instrument_key} not found in NFO instruments")
-        tradingsymbol = row.iloc[0]["tradingsymbol"]
-
-        order_params = {
-            "tradingsymbol":    tradingsymbol,
-            "exchange":         _EXCHANGE_NFO,
-            "transaction_type": kite_txn,
-            "quantity":         quantity,
-            "order_type":       kite_order_type,
-            "product":          self.kite.PRODUCT_MIS,  # intraday margin
-            "validity":         self.kite.VALIDITY_DAY,
-            "tag":              tag[:20] if tag else "",  # Zerodha tag limit: 20 chars
-        }
-        if order_type.upper() == "LIMIT" and price > 0:
-            order_params["price"] = price
-
-        logger.info("Placing order: %s", order_params)
+        kite_txn = (
+            KiteConnect.TRANSACTION_TYPE_BUY  if transaction_type == "BUY"
+            else KiteConnect.TRANSACTION_TYPE_SELL
+        )
         order_id = self.kite.place_order(
-            variety=self.kite.VARIETY_REGULAR,
-            **order_params,
+            variety  = KiteConnect.VARIETY_REGULAR,
+            exchange = exchange,
+            tradingsymbol   = instrument_key,
+            transaction_type= kite_txn,
+            quantity        = quantity,
+            product         = KiteConnect.PRODUCT_MIS,   # intraday margin for weekly options
+            order_type      = kite_order_type,
+            price           = price if order_type == "LIMIT" else None,
+            tag             = tag[:20] if tag else None,
         )
-        logger.info("Order placed. order_id=%s", order_id)
+        logger.info("Order placed: %s %s %s qty=%d order_id=%s",
+                    transaction_type, instrument_key, order_type, quantity, order_id)
         return str(order_id)
 
     def get_positions(self) -> pd.DataFrame:
-        """Return current day + net positions as a combined DataFrame."""
-        positions = self.kite.positions()
-        day_pos = positions.get("day", [])
-        net_pos = positions.get("net", [])
-        all_pos = day_pos + net_pos
-        if not all_pos:
+        try:
+            resp = self.kite.positions()
+            day_pos = resp.get("day", [])
+            return pd.DataFrame(day_pos) if day_pos else pd.DataFrame()
+        except Exception as e:
+            logger.error("get_positions failed: %s", e)
             return pd.DataFrame()
-        return pd.DataFrame(all_pos)
 
     def get_order_status(self, order_id: str) -> dict:
-        """Return full order detail dict for given order_id."""
-        orders = self.kite.orders()
-        for order in orders:
-            if str(order.get("order_id")) == str(order_id):
-                return order
-        return {}
-
-    # ── Margin helpers ────────────────────────────────────────────────
+        try:
+            orders = self.kite.orders()
+            for o in orders:
+                if str(o["order_id"]) == str(order_id):
+                    return o
+            return {"status": "NOT_FOUND", "order_id": order_id}
+        except Exception as e:
+            logger.error("get_order_status failed: %s", e)
+            return {"status": "ERROR", "message": str(e)}
 
     def get_available_margin(self) -> float:
-        """
-        Return available cash margin for F&O segment (in ₹).
-        Used by RiskManager to enforce ₹3L capital cap.
-        """
-        margins = self.kite.margins(segment="equity")
-        fno = self.kite.margins(segment="commodity")  # F&O is under commodity segment in Kite
-        # Zerodha returns margins per segment; use net available for F&O
+        """Return available cash margin for F&O segment in ₹."""
         try:
-            fno_margins = self.kite.margins()
-            return float(fno_margins.get("equity", {}).get("available", {}).get("cash", 0.0))
+            margins = self.kite.margins(segment="equity")  # or "commodity"
+            # For F&O: use 'net' from equity segment
+            return float(margins.get("net", 0.0))
         except Exception as e:
-            logger.warning("Could not fetch F&O margins: %s", e)
+            logger.error("get_available_margin failed: %s", e)
             return 0.0
+
+
+# ── Login helper ────────────────────────────────────────────────────
+# Run: python -m src.broker.zerodha_login
+# This is a separate file to keep zerodha.py clean.
